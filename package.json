@@ -1,0 +1,23 @@
+{
+  "name": "hawkeye",
+  "version": "1.0.0",
+  "description": "> Detectar defeitos em produtos por meio de análise automatizada de imagens na linha de produção.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d3vluz/HawkEye.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/d3vluz/HawkEye/issues"
+  },
+  "homepage": "https://github.com/d3vluz/HawkEye#readme",
+  "workspaces": [
+    "apps/web"
+  ]
+}
