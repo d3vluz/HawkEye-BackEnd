@@ -26,5 +26,5 @@ O **HawkEye** é um sistema em desenvolvimento que utiliza processamento de imag
 
 3. Execute o Sistema:
   ```bash
-   python main.py
+   uvicorn main:app --reload
    ```
