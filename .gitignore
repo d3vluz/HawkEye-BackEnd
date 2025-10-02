@@ -1,1 +1,3 @@
 api/__pycache__/
+test/*/processados/
+test/imagens_pins/
