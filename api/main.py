@@ -13,7 +13,7 @@ import base64
 from typing import List, Dict, Tuple
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import logging
 import cv2
 import numpy as np
@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Image Processing API",
     description="API para processamento de imagens em lote",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS
-origins = ["http://localhost:3000",]
+origins = ["http://localhost:3000"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -113,35 +113,64 @@ def detect_areas(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
     """
     img_array = np.array(image.convert('RGB'))
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
+                           minLineLength=100, maxLineGap=20)
     
-    # Aplicar threshold adaptativo para detectar as grades
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 11, 2)
+    line_mask = np.zeros_like(gray)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, 2)
+
+    inverted = cv2.bitwise_not(line_mask)
+    contours, _ = cv2.findContours(inverted, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+    img_area = image.width * image.height
+    min_area = img_area * 0.005
+    max_area = img_area * 0.3
     
-    # Encontrar contornos
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if min_area < area < max_area:
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+            if len(approx) >= 4:
+                valid_contours.append(cnt)
+
+    if len(valid_contours) == 0:
+        logger.warning("Método de linhas não encontrou áreas, tentando método alternativo")
+        binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_contours = [cnt for cnt in contours if min_area < cv2.contourArea(cnt) < max_area]
     
-    # Filtrar contornos por área mínima
-    min_area = (image.width * image.height) / 100  # pelo menos 1% da imagem
-    valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
+    valid_contours = sorted(valid_contours, key=cv2.contourArea, reverse=True)[:30]
     
-    # Ordenar contornos por área e pegar os retângulos principais
-    valid_contours = sorted(valid_contours, key=cv2.contourArea, reverse=True)
-    
-    # Criar imagem de saída
     output_img = img_array.copy()
     areas_info = []
     
-    for idx, contour in enumerate(valid_contours[:20]):  # Limitar a 20 áreas
+    for idx, contour in enumerate(valid_contours):
         x, y, w, h = cv2.boundingRect(contour)
         area = cv2.contourArea(contour)
-        
-        # Desenhar retângulo
-        cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        
-        # Adicionar número da área
-        cv2.putText(output_img, f"Area {idx+1}", (x, y-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        cv2.drawContours(output_img, [contour], -1, (0, 255, 0), 2)
+        cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 200, 0), 1)
+
+        label = f"{idx+1}"
+        font_scale = 0.6
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+        cv2.rectangle(output_img, (x, y-text_h-10), (x+text_w+10, y), (0, 255, 0), -1)
+        cv2.putText(output_img, label, (x+5, y-5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
         
         areas_info.append({
             "area_id": idx + 1,
@@ -171,55 +200,71 @@ def detect_pins(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
       - List[Dict]: Lista de informações sobre cada pin
     """
     img_array = np.array(image.convert('RGB'))
-    
-    # Converter para HSV para detectar objetos amarelos
     hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
     
-    # Definir range para cor amarela
-    lower_yellow = np.array([20, 100, 100])
-    upper_yellow = np.array([30, 255, 255])
-    
-    # Criar máscara para objetos amarelos
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    
-    # Aplicar operações morfológicas para limpar a máscara
+    masks = []
+
+    lower1 = np.array([20, 100, 100])
+    upper1 = np.array([30, 255, 255])
+    masks.append(cv2.inRange(hsv, lower1, upper1))
+
+    lower2 = np.array([15, 80, 80])
+    upper2 = np.array([35, 255, 255])
+    masks.append(cv2.inRange(hsv, lower2, upper2))
+
+    lower3 = np.array([5, 100, 100])
+    upper3 = np.array([15, 255, 255])
+    masks.append(cv2.inRange(hsv, lower3, upper3))
+
+    mask = masks[0]
+    for m in masks[1:]:
+        mask = cv2.bitwise_or(mask, m)
+
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    
-    # Encontrar contornos dos pins
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    mask = cv2.medianBlur(mask, 5)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Filtrar contornos por área
-    min_pin_area = 50  # área mínima de um pin
-    max_pin_area = 5000  # área máxima de um pin
+
+    img_area = image.width * image.height
+    min_pin_area = img_area * 0.0001  
+    max_pin_area = img_area * 0.01    
     
     valid_pins = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if min_pin_area < area < max_pin_area:
-            valid_pins.append(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter ** 2)
+                if circularity > 0.3:
+                    valid_pins.append(cnt)
     
-    # Criar imagem de saída
     output_img = img_array.copy()
     pins_info = []
     
     for idx, contour in enumerate(valid_pins):
-        # Calcular o centro do contorno
         M = cv2.moments(contour)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
         else:
             cx, cy = 0, 0
-        
-        # Desenhar contorno e centro
+
         cv2.drawContours(output_img, [contour], -1, (255, 0, 0), 2)
         cv2.circle(output_img, (cx, cy), 5, (0, 0, 255), -1)
+        cv2.circle(output_img, (cx, cy), 8, (255, 255, 0), 2)
         
-        # Adicionar número do pin
-        cv2.putText(output_img, str(idx+1), (cx-10, cy-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+        label = str(idx+1)
+        font_scale = 0.5
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+        cv2.rectangle(output_img, (cx-15, cy-25), (cx+15, cy-10), (255, 0, 0), -1)
+        cv2.putText(output_img, label, (cx-10, cy-15), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
         
         x, y, w, h = cv2.boundingRect(contour)
         pins_info.append({
@@ -248,10 +293,7 @@ def process_image(image: Image.Image) -> Dict:
     Retorna:
     - Dict: Dicionário com imagens processadas e informações
     """
-    # Detectar áreas
     areas_image, areas_count, areas_info = detect_areas(image.copy())
-    
-    # Detectar pins
     pins_image, pins_count, pins_info = detect_pins(image.copy())
     
     return {
@@ -276,7 +318,7 @@ async def root():
     """
     return {
         "message": "Image Processing API está funcionando!",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "process_images": "/process-images/"
         }
