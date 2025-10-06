@@ -96,7 +96,6 @@ def image_to_base64(image: Image.Image, format: str = "JPEG") -> str:
     mime_type = "image/jpeg" if format == "JPEG" else f"image/{format.lower()}"
     return f"data:{mime_type};base64,{img_str}"
 
-
 def detect_areas(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
     """
     @function detect_areas
@@ -184,11 +183,11 @@ def detect_areas(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
     result_image = Image.fromarray(output_img)
     return result_image, len(valid_contours), areas_info
 
-
-def detect_pins(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
+def detect_pins(image: Image.Image) -> Tuple[Image.Image, int]:
     """
     @function detect_pins
-    Descrição: Detecta e conta os pins (tachinhas) na imagem.
+    Descrição: Detecta e conta os pins (tachinhas) na imagem usando segmentação
+    por cor HSV e algoritmo Watershed para separar objetos próximos.
     
     Parâmetros:
     - image (PIL.Image.Image): Imagem original
@@ -197,90 +196,121 @@ def detect_pins(image: Image.Image) -> Tuple[Image.Image, int, List[Dict]]:
     - Tuple contendo:
       - Image.Image: Imagem com pins destacados
       - int: Número de pins detectados
-      - List[Dict]: Lista de informações sobre cada pin
     """
+    # Converter para array numpy e HSV
     img_array = np.array(image.convert('RGB'))
-    hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+    image_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    hsv_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     
-    masks = []
-
-    lower1 = np.array([20, 100, 100])
-    upper1 = np.array([30, 255, 255])
-    masks.append(cv2.inRange(hsv, lower1, upper1))
-
-    lower2 = np.array([15, 80, 80])
-    upper2 = np.array([35, 255, 255])
-    masks.append(cv2.inRange(hsv, lower2, upper2))
-
-    lower3 = np.array([5, 100, 100])
-    upper3 = np.array([15, 255, 255])
-    masks.append(cv2.inRange(hsv, lower3, upper3))
-
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = cv2.bitwise_or(mask, m)
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    mask = cv2.medianBlur(mask, 5)
-
+    # Segmentação por cor (amarelo) - parâmetros do notebook
+    lower_yellow = np.array([10, 165, 100])
+    upper_yellow = np.array([30, 255, 255])
+    mask = cv2.inRange(hsv_image, lower_yellow, upper_yellow)
+    
+    # Detecção de contornos inicial
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    img_area = image.width * image.height
-    min_pin_area = img_area * 0.0001  
-    max_pin_area = img_area * 0.01    
+    min_area = 2000
     
-    valid_pins = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if min_pin_area < area < max_pin_area:
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter > 0:
-                circularity = 4 * np.pi * area / (perimeter ** 2)
-                if circularity > 0.3:
-                    valid_pins.append(cnt)
+    filtered_contours = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > min_area:
+            filtered_contours.append(contour)
     
+    # Se não houver objetos próximos, usar contornos simples
+    if len(filtered_contours) <= 1:
+        output_img = img_array.copy()
+        
+        for idx, contour in enumerate(filtered_contours):
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx, cy = 0, 0
+            
+            cv2.drawContours(output_img, [contour], -1, (255, 0, 255), 3)
+            cv2.circle(output_img, (cx, cy), 5, (0, 0, 255), -1)
+            
+            label = str(idx + 1)
+            font_scale = 0.5
+            thickness = 2
+            
+            cv2.rectangle(output_img, (cx-15, cy-25), (cx+15, cy-10), (255, 0, 255), -1)
+            cv2.putText(output_img, label, (cx-10, cy-15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+        
+        result_image = Image.fromarray(output_img)
+        return result_image, len(filtered_contours)
+    
+    # Aplicar Watershed para separar objetos próximos
+    # 1. Abertura Morfológica
+    kernel = np.ones((5, 5), np.uint8)
+    opening = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=5)
+    
+    # 2. Fundo Definido (Sure Background)
+    sure_bg = cv2.dilate(opening, kernel, iterations=1)
+    
+    # 3. Transformação de Distância
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    
+    # 4. Primeiro Plano Definido (Sure Foreground)
+    _, sure_fg = cv2.threshold(dist_transform, 0.22 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+    
+    # 5. Região Desconhecida
+    unknown = cv2.subtract(sure_bg, sure_fg)
+    
+    # 6. Marcadores para o Watershed
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+    
+    # 7. Aplicar Watershed
+    image_for_watershed = img_array.copy()
+    markers = cv2.watershed(image_for_watershed, markers)
+    
+    # 8. Extrair contornos separados
     output_img = img_array.copy()
-    pins_info = []
+    pin_count = 0
     
-    for idx, contour in enumerate(valid_pins):
-        M = cv2.moments(contour)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-        else:
-            cx, cy = 0, 0
-
-        cv2.drawContours(output_img, [contour], -1, (255, 0, 0), 2)
-        cv2.circle(output_img, (cx, cy), 5, (0, 0, 255), -1)
-        cv2.circle(output_img, (cx, cy), 8, (255, 255, 0), 2)
+    for label in np.unique(markers):
+        if label <= 1:  # Ignorar background e bordas
+            continue
         
-        label = str(idx+1)
-        font_scale = 0.5
-        thickness = 2
-        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-
-        cv2.rectangle(output_img, (cx-15, cy-25), (cx+15, cy-10), (255, 0, 0), -1)
-        cv2.putText(output_img, label, (cx-10, cy-15), 
-                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+        object_mask = np.zeros(mask.shape, dtype="uint8")
+        object_mask[markers == label] = 255
         
-        x, y, w, h = cv2.boundingRect(contour)
-        pins_info.append({
-            "pin_id": idx + 1,
-            "center_x": cx,
-            "center_y": cy,
-            "x": int(x),
-            "y": int(y),
-            "width": int(w),
-            "height": int(h),
-            "area": int(cv2.contourArea(contour))
-        })
+        contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            if cv2.contourArea(contour) > 500:
+                pin_count += 1
+                
+                # Calcular centro
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                else:
+                    cx, cy = 0, 0
+                
+                # Desenhar contorno e marcadores
+                cv2.drawContours(output_img, [contour], -1, (255, 0, 255), 3)
+                cv2.circle(output_img, (cx, cy), 5, (0, 0, 255), -1)
+                cv2.circle(output_img, (cx, cy), 8, (255, 255, 0), 2)
+                
+                # Label
+                label_text = str(pin_count)
+                font_scale = 0.5
+                thickness = 2
+                
+                cv2.rectangle(output_img, (cx-15, cy-25), (cx+15, cy-10), (255, 0, 255), -1)
+                cv2.putText(output_img, label_text, (cx-10, cy-15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
     
     result_image = Image.fromarray(output_img)
-    return result_image, len(valid_pins), pins_info
-
+    return result_image, pin_count
 
 def process_image(image: Image.Image) -> Dict:
     """
@@ -294,7 +324,7 @@ def process_image(image: Image.Image) -> Dict:
     - Dict: Dicionário com imagens processadas e informações
     """
     areas_image, areas_count, areas_info = detect_areas(image.copy())
-    pins_image, pins_count, pins_info = detect_pins(image.copy())
+    pins_image, pins_count = detect_pins(image.copy())
     
     return {
         "areas_image": areas_image,
@@ -302,9 +332,7 @@ def process_image(image: Image.Image) -> Dict:
         "areas_info": areas_info,
         "pins_image": pins_image,
         "pins_count": pins_count,
-        "pins_info": pins_info
     }
-
 
 @app.get("/")
 async def root():
@@ -339,8 +367,7 @@ async def process_images(files: List[UploadFile] = File(...)):
 
     Retorna:
     - dict: {"processed_images": [{filename, original_image_data,
-      areas_image_data, pins_image_data, areas_count, pins_count, 
-      areas_info, pins_info}]}
+      areas_image_data, pins_image_data, areas_count, pins_count, areas_info}]}
 
     Exceções:
     - HTTPException 400: Nenhum arquivo, excesso de quantidade, tipo inválido
@@ -396,8 +423,7 @@ async def process_images(files: List[UploadFile] = File(...)):
                 "pins_image_data": pins_base64,
                 "areas_count": processing_result["areas_count"],
                 "pins_count": processing_result["pins_count"],
-                "areas_info": processing_result["areas_info"],
-                "pins_info": processing_result["pins_info"]
+                "areas_info": processing_result["areas_info"]
             })
             
             logger.info(f"Imagem {idx + 1}/{len(files)} processada: {file.filename} - "
